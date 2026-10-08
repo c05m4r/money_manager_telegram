@@ -80,7 +80,7 @@ Formato EARS. Criterios de aceptación en Given/When/Then.
 - **RF-01.9** `/me` DEBE mostrar username, email, rol, email verificado, último login y si hay credenciales guardadas (`GET /users/{uuid}`).
 - **RF-01.10** El bot DEBE persistir en SQLite la sesión y el estado de los diálogos, para sobrevivir reinicios sin volver a pedir login.
 - **RF-01.11** El bot DEBE limitar los intentos de login fallidos: 5 por Telegram ID cada 15 minutos.
-- **RF-01.12** El bot DEBE mostrar en el menú de Telegram (`setMyCommands` con scope por chat) solo los comandos que el rol del usuario puede usar.
+- **RF-01.12** El bot DEBE mostrar en el menú de Telegram (`setMyCommands` con scope por chat) solo los comandos que el rol del usuario puede usar. El menú se actualiza en `/login`, `/start`, `/logout` y cuando la sesión vence.
 - **RF-01.13** Todo comando de finanzas sin sesión DEBE responder "Iniciá sesión con /login".
 
 ```
@@ -104,7 +104,7 @@ Then la sesión sigue activa
   - categoría: la indicada con `#nombre` (coincidencia sin mayúsculas ni acentos, primero exacta y luego por prefijo único);
   - fecha: ahora, salvo `today`/`hoy`, `yesterday`/`ayer`, `dd/mm` o `dd/mm/yyyy` como primera palabra después del monto;
   - descripción: el resto del texto (opcional, 1–400 caracteres).
-- **RF-02.2** Si la categoría falta o es ambigua, el bot DEBE ofrecer un teclado inline con las categorías del usuario (las 8 más usadas primero + "Más…" + "Sin categoría").
+- **RF-02.2** Si la categoría falta o es ambigua, el bot DEBE ofrecer un teclado inline con las categorías del usuario (hasta 30, las más usadas primero según `GET /reports/by-category` + "Sin categoría").
 - **RF-02.3** Si la categoría `#x` no existe, el bot DEBE ofrecer "Crear categoría x" (como el combobox del frontend).
 - **RF-02.4** El monto DEBE ser positivo, con hasta 2 decimales. Formatos aceptados: `1500`, `1500.5`, `1500,50`, `1.500,50`, `1,500.50`. El bot envía siempre `amount` como string con punto decimal.
 - **RF-02.5 Alta guiada.** `/new` DEBE iniciar un asistente: tipo → monto → categoría → cuenta → fecha → descripción → confirmación. `/cancel` aborta en cualquier paso.
@@ -112,7 +112,7 @@ Then la sesión sigue activa
 - **RF-02.7 Listado.** `/transactions [filters]` DEBE listar transacciones paginadas (10 por página, botones ◀ ▶), ordenadas por fecha descendente (`sort=-transaction_date`, default del backend). Filtros: `@account`, `#category`, `expenses|income`, `month:mm/yyyy`, `from:dd/mm[/yyyy]`, `to:dd/mm[/yyyy]`, texto libre (→ `search`). Mapea a los query params de `GET /transactions`.
 - **RF-02.8** Cada fila DEBE mostrar referencia corta, fecha, signo (− gasto, + ingreso), monto con símbolo de moneda, categoría y descripción truncada.
 - **RF-02.9 Detalle.** `/show <ref>` DEBE mostrar todos los campos con nombres resueltos (tipo, categoría, cuenta).
-- **RF-02.10 Edición.** `/edit <ref>` (o botón) DEBE ofrecer elegir el campo (monto, tipo, categoría, cuenta, fecha, descripción) y enviar `PATCH /transactions/{uuid}` solo con ese campo. Para desvincular categoría se envía `null` explícito.
+- **RF-02.10 Edición.** `/edit <ref>` (o botón) DEBE ofrecer elegir el campo (monto, tipo, categoría, cuenta, fecha, descripción) y enviar `PATCH /transactions/{uuid}` solo con ese campo. Para desvincular categoría se envía `null` explícito. La descripción no se puede vaciar (el backend exige 1–400 caracteres).
 - **RF-02.11 Baja.** `/delete <ref>` (o botón) DEBE pedir confirmación inline y luego llamar `DELETE /transactions/{uuid}` (soft delete).
 
 ```

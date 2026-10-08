@@ -122,9 +122,10 @@ money_manager_telegram/
 │   └── services/
 │       ├── parse.rs
 │       └── matching.rs
-└── tests/
-    ├── api_client.rs          # wiremock
-    └── session_store.rs       # SQLite en memoria
+└── src/live_tests.rs         # test #[ignore] contra un backend real (MM_LIVE_URL)
+
+Los tests unitarios y de integración (wiremock, SQLite en memoria) viven en módulos `#[cfg(test)]`
+junto al código: el crate es un binario y `tests/` no ve sus módulos internos.
 ```
 
 ## 6. Dependencias del bot
@@ -214,7 +215,7 @@ token_for(telegram_user_id):
 - `ApiClient` ante `401` con JWT: invalida `jwt_expires_at`, llama `token_for` y reintenta una vez. Un segundo `401` → `BotError::SessionExpired`.
 - `exp` se lee del payload del JWT (base64, sin verificar firma: el bot no tiene la clave y solo lo usa para saber cuándo renovar).
 - Un `Mutex` por `telegram_user_id` evita varios re-login en paralelo para el mismo usuario.
-- Si cambia el rol, se vuelve a ejecutar `setMyCommands` para ese chat (RF-01.12).
+- El menú por rol (`setMyCommands`) se actualiza en `/login`, `/start`, `/logout` y al vencer la sesión (RF-01.12).
 
 ### 7.3 DTOs (`api/models.rs`)
 
@@ -285,9 +286,9 @@ Los handlers devuelven `Result<(), BotError>`. Un único `error_handler` envía 
 | `account_edit`, `account_delete`, `account_default` | `<ref>` | `user` | teclado de cuentas |
 | `category_new` | `<name>` | `user` | pide nombre |
 | `category_edit`, `category_delete` | `<ref>` | `user` | teclado de categorías |
-| `currency_new` | `<CODE> <symbol> <name…>` | `manager` | pide campos faltantes |
+| `currency_new` | `<CODE> <symbol> <name…>` | `manager` | muestra el uso |
 | `currency_edit`, `currency_delete` | `<CODE>` | `manager` | teclado de monedas |
-| `type_new` | `<code> <name…>` | `manager` | pide campos faltantes |
+| `type_new` | `<code> <name…>` | `manager` | muestra el uso |
 | `type_edit`, `type_delete` | `<ref>` | `manager` | teclado de tipos |
 
 Lectura de la columna "Rol mínimo":

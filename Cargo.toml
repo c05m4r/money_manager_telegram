@@ -1,0 +1,30 @@
+[package]
+name = "money_manager_telegram"
+version = "0.1.0"
+edition = "2024"
+authors = ["Marcos Gabriel Miller"]
+license = "GPL-3.0"
+
+[dependencies]
+teloxide = { version = "0.17.0", default-features = false, features = ["macros", "rustls", "ctrlc_handler", "sqlite-storage-rustls"] }
+# Same major versions teloxide uses, so the dependency tree is not duplicated.
+sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust_decimal = { version = "1.43", features = ["serde-str"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
+uuid = { version = "1.27", features = ["serde", "v4"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15.7"
+unicode-normalization = "0.1.25"
+aes-gcm = "0.10.3"
+zeroize = "1.8"
+base64 = "0.22"
+
+[dev-dependencies]
+wiremock = "0.6.5"
