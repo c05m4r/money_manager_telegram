@@ -7,6 +7,106 @@ cuentas, categorías, monedas, tipos de transacción, saldos y resúmenes mensua
 El bot es un cliente HTTP de la API. El backend no sabe nada de Telegram. La especificación
 completa (SDD) está en [`specs/`](specs/).
 
+## Quickstart
+
+Puesta en marcha local: backend + bot, en unos 10 minutos.
+
+### 1. Levantar el backend
+
+```bash
+git clone git@github.com:c05m4r/money_manager_backend.git
+cd money_manager_backend
+cp env/.env.example env/.env        # cambiá JWT_SECRET fuera de desarrollo
+```
+
+Elegí una opción:
+
+```bash
+# a) Todo en Docker (Postgres + Mailpit + backend en :8000)
+cd docker && docker compose --profile dev up -d --build && cd ..
+
+# b) Postgres en Docker, backend con cargo
+cd docker && docker compose up -d postgres && cd ..
+cargo run
+```
+
+Al arrancar, el backend aplica las migraciones y crea los usuarios seed (`default`, `manager`,
+`admin` y `auditor`, todos con la contraseña `ContraseniaSegura2026!`). Comprobá que responde:
+
+```bash
+curl http://127.0.0.1:8000/api/v1/health
+# {"database":"up","status":"healthy",...}
+```
+
+> Los usuarios seed son para desarrollo. En un entorno real creá tu propio usuario y cambiá esas contraseñas.
+
+### 2. Crear el bot en Telegram
+
+1. Abrí [@BotFather](https://t.me/BotFather), enviá `/newbot` y seguí los pasos.
+2. Copiá el token (`123456789:AA…`). Es secreto: quien lo tenga controla el bot.
+3. Opcional: pedile tu ID numérico a [@userinfobot](https://t.me/userinfobot) para restringir el bot solo a vos.
+
+### 3. Configurar el bot
+
+```bash
+git clone git@github.com:c05m4r/money_manager_telegram.git
+cd money_manager_telegram
+cp env/.env.example env/.env
+openssl rand -base64 32             # copiá la salida
+```
+
+Editá `env/.env` con al menos estas variables:
+
+```dotenv
+TELOXIDE_TOKEN=123456789:AA...          # token de @BotFather
+CREDENTIALS_KEY=<salida de openssl>     # 32 bytes en base64
+BACKEND_API_URL=http://127.0.0.1:8000/api/v1
+ALLOWED_TELEGRAM_IDS=123456789          # opcional: tu ID de @userinfobot
+```
+
+La URL del backend depende de dónde corra cada uno:
+
+| Backend | Bot | `BACKEND_API_URL` |
+|---------|-----|-------------------|
+| `cargo run` en el host | `cargo run` en el host | `http://127.0.0.1:8000/api/v1` |
+| Docker (`--profile dev`) | `cargo run` en el host | `http://127.0.0.1:8000/api/v1` |
+| Docker (`--profile dev`) | Docker (`docker compose`) | `http://host.docker.internal:8000/api/v1` |
+| `cargo run` en el host | Docker (`docker compose`) | `http://host.docker.internal:8000/api/v1` y en el `env/.env` del backend `APP_HOST=0.0.0.0` |
+| servidor remoto | cualquiera | `https://tu-dominio/api/v1` (siempre HTTPS fuera de tu red) |
+
+### 4. Arrancar el bot
+
+```bash
+cargo run --release                 # o: docker compose up -d --build
+```
+
+Deberías ver en el log:
+
+```
+INFO money_manager_telegram: starting bot=<tu_bot> backend=http://127.0.0.1:8000/api/v1
+```
+
+### 5. Probarlo
+
+En Telegram, abrí tu bot y enviá:
+
+1. `/start`
+2. `/login default`, y después la contraseña (el bot borra ese mensaje).
+3. `/expense 1500 #coffee cortado` → crea un gasto en tu cuenta por defecto.
+4. `/transactions`, `/balance`, `/summary`, `/help`.
+
+### Problemas comunes
+
+| Síntoma | Causa y solución |
+|---------|------------------|
+| `invalid configuration: TELOXIDE_TOKEN is required` / `CREDENTIALS_KEY is required…` | Falta la variable en `env/.env`. Corré el bot desde la carpeta del repo para que lea `env/.env`. |
+| `CREDENTIALS_KEY must decode to exactly 32 bytes` | Generala de nuevo con `openssl rand -base64 32`. |
+| `cannot reach Telegram (check TELOXIDE_TOKEN): … Invalid bot token` | Token mal copiado o revocado en @BotFather. |
+| El bot responde "El servidor no responde, probá en un rato." | El bot no llega al backend. Probá `curl $BACKEND_API_URL/health` desde donde corre el bot; desde Docker usá `host.docker.internal` y el backend debe escuchar en `0.0.0.0`. |
+| "Usuario o contraseña incorrectos." | Credenciales del backend. Tras 5 fallos hay que esperar 15 minutos. |
+| "Tu sesión venció. Enviá /login…" justo después de actualizar el backend | Los JWT anteriores al cambio de `jti` dejaron de valer. Hacé `/login` una vez. |
+| El bot no contesta nada | Tu ID no está en `ALLOWED_TELEGRAM_IDS`, o le escribiste desde un grupo (solo responde en chats privados). |
+
 ## Cómo funciona la sesión
 
 1. Enviás `/login`, tu usuario o email y tu contraseña del backend. El bot **borra el mensaje con la contraseña** apenas lo lee.
