@@ -1,14 +1,49 @@
 // Copyright (C) 2026 Marcos Gabriel Miller
-use std::{collections::HashSet, fmt, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::PathBuf,
+    time::Duration,
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono_tz::Tz;
+use uuid::Uuid;
 
 const DEFAULT_BACKEND_API_URL: &str = "http://127.0.0.1:8000/api/v1";
+
+/// How a Telegram user gets a backend session (`AUTH_METHOD`).
+#[derive(Clone)]
+pub enum AuthMethod {
+    /// `/login` asks for the backend username/email and password.
+    Password,
+    /// No password: the Telegram account id is the identity and the bot signs backend JWTs.
+    Telegram(TelegramAuth),
+}
+
+#[derive(Clone)]
+pub struct TelegramAuth {
+    /// Same value as the backend's `JWT_SECRET`.
+    pub jwt_secret: String,
+    /// Telegram user id → backend user UUID (`TELEGRAM_USERS`).
+    pub users: HashMap<i64, Uuid>,
+    /// Lifetime of each token the bot signs.
+    pub token_ttl: Duration,
+}
+
+impl AuthMethod {
+    pub fn name(&self) -> &'static str {
+        match self {
+            AuthMethod::Password => "password",
+            AuthMethod::Telegram(_) => "telegram",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct BotConfig {
     pub telegram_token: String,
+    pub auth: AuthMethod,
     pub backend_api_url: String,
     /// Empty means every Telegram user is allowed.
     pub allowed_telegram_ids: HashSet<i64>,
@@ -25,6 +60,7 @@ impl fmt::Debug for BotConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BotConfig")
             .field("telegram_token", &"***")
+            .field("auth", &self.auth.name())
             .field("backend_api_url", &self.backend_api_url)
             .field("allowed_telegram_ids", &self.allowed_telegram_ids)
             .field("database_path", &self.database_path)
@@ -77,6 +113,39 @@ impl BotConfig {
             .parse::<Tz>()
             .map_err(|_| format!("BOT_TZ is not a valid IANA time zone: {tz_name}"))?;
 
+        let auth = match var("AUTH_METHOD")
+            .as_deref()
+            .map(str::to_lowercase)
+            .as_deref()
+        {
+            None | Some("password") => AuthMethod::Password,
+            Some("telegram") => AuthMethod::Telegram(TelegramAuth {
+                jwt_secret: var("JWT_SECRET").ok_or(
+                    "JWT_SECRET is required when AUTH_METHOD=telegram (same value as the backend)",
+                )?,
+                users: parse_telegram_users(
+                    &var("TELEGRAM_USERS")
+                        .ok_or("TELEGRAM_USERS is required when AUTH_METHOD=telegram")?,
+                )?,
+                token_ttl: Duration::from_secs(
+                    60 * match var("TELEGRAM_TOKEN_TTL_MINUTES") {
+                        Some(value) => value
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|minutes| (1..=1440).contains(minutes))
+                            .ok_or("TELEGRAM_TOKEN_TTL_MINUTES must be between 1 and 1440")?,
+                        None => 60,
+                    },
+                ),
+            }),
+            Some(other) => {
+                return Err(format!(
+                    "AUTH_METHOD must be password or telegram, got {other}"
+                ));
+            }
+        };
+
+        // Stored credentials only make sense for the password method.
         let store_credentials = match var("STORE_CREDENTIALS").as_deref() {
             None | Some("true") | Some("1") => true,
             Some("false") | Some("0") => false,
@@ -86,7 +155,7 @@ impl BotConfig {
                 ));
             }
         };
-        let credentials_key = if store_credentials {
+        let credentials_key = if store_credentials && matches!(auth, AuthMethod::Password) {
             let encoded = var("CREDENTIALS_KEY").ok_or(
                 "CREDENTIALS_KEY is required when STORE_CREDENTIALS=true (openssl rand -base64 32)",
             )?;
@@ -114,6 +183,7 @@ impl BotConfig {
 
         Ok(Self {
             telegram_token,
+            auth,
             backend_api_url,
             allowed_telegram_ids,
             database_path,
@@ -138,6 +208,31 @@ impl BotConfig {
         let host = rest.split(['/', ':']).next().unwrap_or_default();
         !(host == "localhost" || host == "127.0.0.1" || host == "::1" || !host.contains('.'))
     }
+}
+
+/// `123456789:<uuid>,987654321:<uuid>`
+fn parse_telegram_users(list: &str) -> Result<HashMap<i64, Uuid>, String> {
+    let users = list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (id, uuid) = entry.split_once(':').ok_or(format!(
+                "TELEGRAM_USERS entry must be <telegram_id>:<user_uuid>, got {entry}"
+            ))?;
+            let id = id
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("TELEGRAM_USERS has an invalid Telegram id: {id}"))?;
+            let uuid = Uuid::parse_str(uuid.trim())
+                .map_err(|_| format!("TELEGRAM_USERS has an invalid user UUID: {uuid}"))?;
+            Ok((id, uuid))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    if users.is_empty() {
+        return Err("TELEGRAM_USERS must map at least one Telegram id".into());
+    }
+    Ok(users)
 }
 
 #[cfg(test)]
@@ -235,5 +330,53 @@ mod tests {
         assert!(config.backend_is_insecure());
         config.backend_api_url = "https://api.example.com/api/v1".into();
         assert!(!config.backend_is_insecure());
+    }
+
+    #[test]
+    fn telegram_auth_method() {
+        let uuid = "019f527b-6f64-7013-b1c1-8f4c5f1c96db";
+        let users = format!("123:{uuid}, 456:{uuid}");
+        let config = BotConfig::from_lookup(lookup(&[
+            ("TELOXIDE_TOKEN", "t"),
+            ("AUTH_METHOD", "telegram"),
+            ("JWT_SECRET", "s3cret"),
+            ("TELEGRAM_USERS", &users),
+        ]))
+        .unwrap();
+        let AuthMethod::Telegram(auth) = &config.auth else {
+            panic!("expected telegram auth");
+        };
+        assert_eq!(auth.users.len(), 2);
+        assert_eq!(auth.users[&123].to_string(), uuid);
+        assert_eq!(auth.token_ttl, Duration::from_secs(3600));
+        assert!(
+            config.credentials_key.is_none(),
+            "no CREDENTIALS_KEY needed"
+        );
+        assert!(!format!("{config:?}").contains("s3cret"));
+
+        let base = [("TELOXIDE_TOKEN", "t"), ("AUTH_METHOD", "telegram")];
+        assert!(
+            BotConfig::from_lookup(lookup(&base)).is_err(),
+            "JWT_SECRET required"
+        );
+        let with_secret = [base[0], base[1], ("JWT_SECRET", "s")];
+        assert!(
+            BotConfig::from_lookup(lookup(&with_secret)).is_err(),
+            "TELEGRAM_USERS required"
+        );
+        for bad in ["123", "x:uuid", &format!("123:{uuid}x"), " , "] {
+            let pairs = [
+                with_secret[0],
+                with_secret[1],
+                with_secret[2],
+                ("TELEGRAM_USERS", bad),
+            ];
+            assert!(BotConfig::from_lookup(lookup(&pairs)).is_err(), "{bad}");
+        }
+        assert!(
+            BotConfig::from_lookup(lookup(&[("TELOXIDE_TOKEN", "t"), ("AUTH_METHOD", "magic")]))
+                .is_err()
+        );
     }
 }

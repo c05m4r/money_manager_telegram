@@ -18,7 +18,7 @@ async fn live_backend_round_trip() {
     let user = std::env::var("MM_LIVE_USER").unwrap_or_else(|_| "default".into());
     let password = std::env::var("MM_LIVE_PASSWORD").expect("MM_LIVE_PASSWORD");
     let api = ApiClient::new(&url, Duration::from_secs(10)).unwrap();
-    let sessions = SessionManager::new(api.clone(), memory_store().await, Some([9; 32]));
+    let sessions = SessionManager::new(api.clone(), memory_store().await, Some([9; 32]), None);
     let uid = 1;
 
     let login = sessions.login(uid, uid, &user, &password).await.unwrap();
@@ -130,5 +130,77 @@ async fn live_backend_round_trip() {
         api.list_currencies(&auth.token).await.unwrap_err().status(),
         Some(401),
         "token revoked (BK-5)"
+    );
+}
+
+/// `MM_LIVE_JWT_SECRET` must be the backend's `JWT_SECRET`.
+#[tokio::test]
+#[ignore = "needs a running backend (MM_LIVE_URL, MM_LIVE_JWT_SECRET)"]
+async fn live_telegram_auth() {
+    use crate::{config::TelegramAuth, session::minter::TokenMinter};
+    use std::collections::HashMap;
+
+    let url = std::env::var("MM_LIVE_URL").expect("MM_LIVE_URL");
+    let secret = std::env::var("MM_LIVE_JWT_SECRET").expect("MM_LIVE_JWT_SECRET");
+    let user = std::env::var("MM_LIVE_USER").unwrap_or_else(|_| "default".into());
+    let password = std::env::var("MM_LIVE_PASSWORD").expect("MM_LIVE_PASSWORD");
+    let api = ApiClient::new(&url, Duration::from_secs(10)).unwrap();
+    // Only to discover the user's UUID for TELEGRAM_USERS.
+    let user_uuid = api.login(&user, &password).await.unwrap().user.uuid;
+
+    let auth = TelegramAuth {
+        jwt_secret: secret,
+        users: HashMap::from([(777, user_uuid)]),
+        token_ttl: Duration::from_secs(300),
+    };
+    let sessions = SessionManager::new(
+        api.clone(),
+        memory_store().await,
+        None,
+        Some(TokenMinter::new(&auth)),
+    );
+
+    let logged = sessions.login_telegram(777, 777).await.unwrap();
+    assert_eq!(logged.uuid, user_uuid);
+    let session = sessions.auth(777).await.unwrap();
+
+    let accounts = api.list_accounts(&session.token, user_uuid).await.unwrap();
+    let out = api
+        .list_types(&session.token)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.code == EXPENSE_CODE)
+        .unwrap();
+    let created = api
+        .create_transaction(
+            &session.token,
+            &CreateTransaction {
+                amount: Decimal::from(42),
+                description: Some("bot telegram auth test".into()),
+                transaction_date: Utc::now(),
+                type_uuid: out.uuid,
+                category_uuid: None,
+                account_uuid: accounts[0].uuid,
+            },
+        )
+        .await
+        .unwrap();
+    api.delete_transaction(&session.token, created.uuid)
+        .await
+        .unwrap();
+
+    assert!(
+        sessions.login_telegram(778, 778).await.is_err(),
+        "unmapped Telegram id"
+    );
+
+    sessions.logout(777).await.unwrap();
+    assert_eq!(
+        api.list_currencies(&session.token)
+            .await
+            .unwrap_err()
+            .status(),
+        Some(401)
     );
 }

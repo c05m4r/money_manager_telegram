@@ -81,6 +81,15 @@ El backend no se modifica para Telegram (D1): no hay fase de backend para el bot
 - [ ] T9.4 Ejecutar el checklist E2E del README con un bot real de Telegram (requiere `TELOXIDE_TOKEN`).
 - [x] T9.3 Revisión de seguridad: logs sin secretos, permisos del SQLite, allowlist, rate limits. (RNF-02)
 
+## Fase 10 — Método de login `telegram` (D9)
+
+- [x] T10.1 `AUTH_METHOD`, `JWT_SECRET`, `TELEGRAM_USERS`, `TELEGRAM_TOKEN_TTL_MINUTES` en `config.rs` + tests. (RF-01.14, RF-01.15)
+- [x] T10.2 `session/minter.rs`: firma HS256 compatible con el backend, token bootstrap + tests. (RF-01.17, RF-01.18)
+- [x] T10.3 `SessionManager::login_telegram` y renovación en `auth()`, con verificación de usuario activo y mapeo. (RF-01.16, RF-01.19, RF-01.20)
+- [x] T10.4 `/start`, `/login`, `/logout` y `/me` según el método; `/me` muestra UUID y Telegram ID.
+- [x] T10.5 Tests wiremock y test en vivo `live_telegram_auth` contra el backend.
+- [x] T10.6 `env/.env.example` y README (quickstart, métodos de login, seguridad, problemas comunes). (RF-01.21)
+
 ## Post-MVP
 
 - [ ] P1 Recordatorios programados (resumen semanal automático).

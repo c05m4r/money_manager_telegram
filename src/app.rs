@@ -9,11 +9,12 @@ use chrono::{NaiveDate, Utc};
 
 use crate::{
     api::{ApiClient, ApiError},
-    config::BotConfig,
+    config::{AuthMethod, BotConfig},
     errors::BotResult,
     session::{
         Auth, SessionManager,
         catalog::{Catalog, CatalogCache},
+        minter::TokenMinter,
         store::Store,
     },
 };
@@ -35,7 +36,12 @@ pub type AppRef = Arc<App>;
 
 impl App {
     pub fn new(config: BotConfig, bot_username: String, api: ApiClient, store: Store) -> Self {
-        let sessions = SessionManager::new(api.clone(), store.clone(), config.credentials_key);
+        let minter = match &config.auth {
+            AuthMethod::Telegram(auth) => Some(TokenMinter::new(auth)),
+            AuthMethod::Password => None,
+        };
+        let sessions =
+            SessionManager::new(api.clone(), store.clone(), config.credentials_key, minter);
         let catalogs = CatalogCache::new(config.cache_ttl);
         Self {
             config,

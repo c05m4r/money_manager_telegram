@@ -55,14 +55,37 @@ cp env/.env.example env/.env
 openssl rand -base64 32             # copiá la salida
 ```
 
-Editá `env/.env` con al menos estas variables:
+Elegí cómo se loguean los usuarios con `AUTH_METHOD` (ver [Métodos de login](#métodos-de-login)).
+
+**Opción A: `AUTH_METHOD=password`** (default). `/login` pide usuario y contraseña.
 
 ```dotenv
 TELOXIDE_TOKEN=123456789:AA...          # token de @BotFather
+AUTH_METHOD=password
 CREDENTIALS_KEY=<salida de openssl>     # 32 bytes en base64
 BACKEND_API_URL=http://127.0.0.1:8000/api/v1
 ALLOWED_TELEGRAM_IDS=123456789          # opcional: tu ID de @userinfobot
 ```
+
+**Opción B: `AUTH_METHOD=telegram`**. Sin contraseña: tu cuenta de Telegram es tu identidad.
+
+```dotenv
+TELOXIDE_TOKEN=123456789:AA...
+AUTH_METHOD=telegram
+JWT_SECRET=<el mismo JWT_SECRET del backend>   # con --profile dev es dev-change-me
+TELEGRAM_USERS=123456789:<uuid de tu usuario>  # tu ID de @userinfobot : tu UUID en el backend
+BACKEND_API_URL=http://127.0.0.1:8000/api/v1
+```
+
+Para obtener el UUID de tu usuario:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"default","password":"ContraseniaSegura2026!"}' | grep -o '"uuid":"[^"]*"' | head -1
+```
+
+O usá `/me` con el método `password`: muestra tu ID y tu Telegram ID.
 
 La URL del backend depende de dónde corra cada uno:
 
@@ -83,7 +106,7 @@ cargo run --release                 # o: docker compose up -d --build
 Deberías ver en el log:
 
 ```
-INFO money_manager_telegram: starting bot=<tu_bot> backend=http://127.0.0.1:8000/api/v1
+INFO money_manager_telegram: starting bot=<tu_bot> backend=http://127.0.0.1:8000/api/v1 auth="password"
 ```
 
 ### 5. Probarlo
@@ -91,7 +114,8 @@ INFO money_manager_telegram: starting bot=<tu_bot> backend=http://127.0.0.1:8000
 En Telegram, abrí tu bot y enviá:
 
 1. `/start`
-2. `/login default`, y después la contraseña (el bot borra ese mensaje).
+2. Con `password`: `/login default`, y después la contraseña (el bot borra ese mensaje).
+   Con `telegram`: `/start` ya te deja adentro, sin preguntar nada.
 3. `/expense 1500 #coffee cortado` → crea un gasto en tu cuenta por defecto.
 4. `/transactions`, `/balance`, `/summary`, `/help`.
 
@@ -106,8 +130,16 @@ En Telegram, abrí tu bot y enviá:
 | "Usuario o contraseña incorrectos." | Credenciales del backend. Tras 5 fallos hay que esperar 15 minutos. |
 | "Tu sesión venció. Enviá /login…" justo después de actualizar el backend | Los JWT anteriores al cambio de `jti` dejaron de valer. Hacé `/login` una vez. |
 | El bot no contesta nada | Tu ID no está en `ALLOWED_TELEGRAM_IDS`, o le escribiste desde un grupo (solo responde en chats privados). |
+| `JWT_SECRET is required when AUTH_METHOD=telegram…` / `TELEGRAM_USERS…` | Completá esas variables o volvé a `AUTH_METHOD=password`. |
+| "Tu cuenta de Telegram no está habilitada en este bot…" | Tu Telegram ID no está en `TELEGRAM_USERS`. El mensaje incluye el ID que hay que agregar. |
+| "El backend rechazó el token del bot (JWT_SECRET no coincide)" | `JWT_SECRET` del bot distinto al del backend. Con `docker compose --profile dev` el backend usa `dev-change-me`. |
+| "El usuario configurado para tu Telegram no existe en el backend." | UUID equivocado en `TELEGRAM_USERS`. |
 
-## Cómo funciona la sesión
+## Métodos de login
+
+Se elige con `AUTH_METHOD`. En los dos casos el backend no se modifica.
+
+### `password` (default)
 
 1. Enviás `/login`, tu usuario o email y tu contraseña del backend. El bot **borra el mensaje con la contraseña** apenas lo lee.
 2. El bot llama `POST /auth/login` y guarda el JWT en su SQLite.
@@ -115,6 +147,18 @@ En Telegram, abrí tu bot y enviá:
 4. `/logout` revoca el JWT en el backend y borra todo lo guardado.
 
 Si cambiás la contraseña en el backend, el próximo re-login falla y el bot te pide `/login` otra vez.
+
+### `telegram` (sin contraseña)
+
+Tu identidad es tu **cuenta de Telegram**: el ID numérico (`from.id`) que Telegram pone en cada mensaje y que no se puede falsificar. No se usa el `@username`, porque se puede cambiar o pasar a otra persona.
+
+1. El operador mapea cada Telegram ID a un usuario del backend en `TELEGRAM_USERS`.
+2. Enviás `/start` (o `/login`). El bot firma un JWT con el `JWT_SECRET` del backend, igual que lo haría el backend en un login.
+3. Antes de firmar, el bot consulta tu usuario en el backend: si no existe o está desactivado, no entrás. Tu rol se toma del backend, no de la configuración.
+4. Los tokens duran `TELEGRAM_TOKEN_TTL_MINUTES` (60 min) y se renuevan solos, verificando de nuevo que sigas activo y mapeado.
+5. `/logout` revoca el token. Para volver alcanza con `/login`. Si te sacan de `TELEGRAM_USERS`, la sesión termina en la próxima renovación.
+
+> ⚠️ Con `AUTH_METHOD=telegram` el bot tiene el `JWT_SECRET` del backend, así que **puede actuar como cualquier usuario del backend, incluido un admin**. Usalo solo si controlás el host del bot tanto como el del backend.
 
 ## Requisitos
 
@@ -132,10 +176,14 @@ openssl rand -base64 32   # pegalo en CREDENTIALS_KEY
 | Variable | Obligatoria | Default | Descripción |
 |----------|-------------|---------|-------------|
 | `TELOXIDE_TOKEN` | sí | — | token de @BotFather |
+| `AUTH_METHOD` | no | `password` | `password` (usuario y contraseña) o `telegram` (sin contraseña) |
+| `JWT_SECRET` | si `AUTH_METHOD=telegram` | — | el mismo `JWT_SECRET` del backend |
+| `TELEGRAM_USERS` | si `AUTH_METHOD=telegram` | — | `telegram_id:user_uuid` separados por coma |
+| `TELEGRAM_TOKEN_TTL_MINUTES` | no | `60` | vida de cada token firmado por el bot (1–1440) |
 | `BACKEND_API_URL` | no | `http://127.0.0.1:8000/api/v1` | URL base de la API |
 | `ALLOWED_TELEGRAM_IDS` | no | vacío = todos | IDs de Telegram separados por coma. Tu ID te lo da [@userinfobot](https://t.me/userinfobot) |
-| `STORE_CREDENTIALS` | no | `true` | guardar credenciales cifradas para re-login automático |
-| `CREDENTIALS_KEY` | si `STORE_CREDENTIALS=true` | — | 32 bytes en base64 (`openssl rand -base64 32`) |
+| `STORE_CREDENTIALS` | no | `true` | solo `password`: guardar credenciales cifradas para re-login automático |
+| `CREDENTIALS_KEY` | si `AUTH_METHOD=password` y `STORE_CREDENTIALS=true` | — | 32 bytes en base64 (`openssl rand -base64 32`) |
 | `DATABASE_PATH` | no | `data/bot.sqlite` | SQLite de sesiones y diálogos (se crea con permisos `0600`) |
 | `BOT_TZ` | no | `America/Argentina/Buenos_Aires` | zona horaria IANA |
 | `CACHE_TTL_SECS` | no | `300` | caché de cuentas, categorías, monedas y tipos |
@@ -185,6 +233,7 @@ Montos: `1500`, `1500,50`, `1.500,50`, `1,500.50`. Fechas: `hoy`, `ayer`, `dd/mm
 - Activá la **verificación en dos pasos de Telegram**: quien controle tu cuenta de Telegram controla tus finanzas en el bot.
 - `CREDENTIALS_KEY` y `TELOXIDE_TOKEN` van solo en el entorno del proceso. Nunca en el repo ni en la imagen.
 - Quien tenga el archivo SQLite **y** `CREDENTIALS_KEY` puede recuperar contraseñas. Protegé el host del bot como protegés el backend, o usá `STORE_CREDENTIALS=false`.
+- Con `AUTH_METHOD=telegram`, `JWT_SECRET` permite firmar tokens de cualquier usuario del backend. Nunca lo subas al repo, no uses `dev-change-me` fuera de desarrollo y rotalo en backend y bot a la vez si se filtra (invalida todas las sesiones).
 - Fuera de tu red, usá `https://` en `BACKEND_API_URL` (el bot avisa al arrancar si no).
 - Los logs nunca incluyen contraseñas, JWT ni bodies.
 
@@ -194,9 +243,9 @@ Montos: `1500`, `1500,50`, `1.500,50`, `1,500.50`. Fechas: `hoy`, `ayer`, `dd/mm
 cargo test                                   # unitarios + wiremock
 cargo clippy --all-targets -- -D warnings
 
-# contra un backend real (crea y borra una transacción de prueba)
+# contra un backend real (crea y borra transacciones de prueba); MM_LIVE_JWT_SECRET para el método telegram
 MM_LIVE_URL=http://127.0.0.1:8000/api/v1 MM_LIVE_USER=default MM_LIVE_PASSWORD='…' \
-  cargo test live -- --ignored
+  MM_LIVE_JWT_SECRET='…' cargo test live -- --ignored
 ```
 
 ### Checklist manual (E2E con Telegram)

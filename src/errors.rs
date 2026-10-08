@@ -21,6 +21,8 @@ pub enum BotError {
     Telegram(#[from] teloxide::RequestError),
     #[error("dialogue storage error: {0}")]
     Dialogue(String),
+    #[error("token signing error: {0}")]
+    Token(String),
 }
 
 pub type BotResult<T = ()> = Result<T, BotError>;
@@ -50,16 +52,20 @@ impl BotError {
                 _ => "El servidor no responde, probá en un rato.".into(),
             },
             BotError::Api(_) => "El servidor no responde, probá en un rato.".into(),
-            BotError::Store(_) | BotError::Telegram(_) | BotError::Dialogue(_) => {
-                "Ocurrió un error interno, probá de nuevo.".into()
-            }
+            BotError::Store(_)
+            | BotError::Telegram(_)
+            | BotError::Dialogue(_)
+            | BotError::Token(_) => "Ocurrió un error interno, probá de nuevo.".into(),
         }
     }
 
     /// Internal failures worth an `error` log; user mistakes are not.
     pub fn is_internal(&self) -> bool {
         match self {
-            BotError::Store(_) | BotError::Telegram(_) | BotError::Dialogue(_) => true,
+            BotError::Store(_)
+            | BotError::Telegram(_)
+            | BotError::Dialogue(_)
+            | BotError::Token(_) => true,
             BotError::Api(ApiError::Http { status, .. }) => *status >= 500,
             BotError::Api(_) => true,
             _ => false,

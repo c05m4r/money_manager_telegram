@@ -42,6 +42,7 @@ pub struct User {
     pub username: String,
     pub email: String,
     pub role: String,
+    pub is_active: bool,
     pub email_verified_at: Option<DateTime<Utc>>,
     pub last_login_at: Option<DateTime<Utc>>,
 }

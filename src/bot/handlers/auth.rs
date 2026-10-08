@@ -24,6 +24,8 @@ pub async fn start(ctx: &Ctx) -> BotResult {
             ))
             .await?;
         }
+        // With AUTH_METHOD=telegram, /start is enough to get in.
+        None if ctx.app.sessions.uses_telegram_auth() => login_telegram(ctx).await?,
         None => {
             ctx.refresh_menu(None).await;
             ctx.send(
@@ -59,6 +61,9 @@ pub async fn help(ctx: &Ctx) -> BotResult {
 }
 
 pub async fn login(ctx: &Ctx, args: &str) -> BotResult {
+    if ctx.app.sessions.uses_telegram_auth() {
+        return login_telegram(ctx).await;
+    }
     if let Some(wait) = ctx.app.sessions.login_retry_after(ctx.uid).await? {
         return Err(too_many_attempts(wait));
     }
@@ -70,6 +75,20 @@ pub async fn login(ctx: &Ctx, args: &str) -> BotResult {
         return Ok(());
     }
     on_identifier(ctx, identifier).await
+}
+
+/// `AUTH_METHOD=telegram`: no questions, the Telegram account is the identity.
+async fn login_telegram(ctx: &Ctx) -> BotResult {
+    let user = ctx.app.sessions.login_telegram(ctx.uid, ctx.chat.0).await?;
+    let role = crate::session::minter::normalize_role(&user.role);
+    ctx.app.invalidate_catalog(ctx.uid);
+    ctx.refresh_menu(Some(role)).await;
+    ctx.send(format!(
+        "Hola {} 👋 Entraste con tu cuenta de Telegram, sin contraseña.\n\nProbá /expense 1500 #cafe o mirá /help",
+        escape(&user.username)
+    ))
+    .await?;
+    Ok(())
 }
 
 pub async fn on_identifier(ctx: &Ctx, text: &str) -> BotResult {
@@ -139,11 +158,13 @@ pub async fn logout(ctx: &Ctx) -> BotResult {
     if ctx.app.store.get_session(ctx.uid).await?.is_none() {
         return Err(BotError::NotLoggedIn);
     }
-    ctx.send_kb(
-        "¿Cerrar sesión? Se revoca el token y se borran tus credenciales guardadas.",
-        keyboards::confirm(Callback::LogoutYes),
-    )
-    .await?;
+    let question = if ctx.app.sessions.uses_telegram_auth() {
+        "¿Cerrar sesión? Se revoca el token. Para volver alcanza con /login."
+    } else {
+        "¿Cerrar sesión? Se revoca el token y se borran tus credenciales guardadas."
+    };
+    ctx.send_kb(question, keyboards::confirm(Callback::LogoutYes))
+        .await?;
     Ok(())
 }
 
@@ -164,15 +185,23 @@ pub async fn me(ctx: &Ctx) -> BotResult {
             api.get_user(&auth.token, auth.user_uuid).await
         })
         .await?;
-    let stored = ctx.app.sessions.has_credentials(ctx.uid).await?;
+    let session_info = if ctx.app.sessions.uses_telegram_auth() {
+        "Telegram (sin contraseña)"
+    } else if ctx.app.sessions.has_credentials(ctx.uid).await? {
+        "usuario y contraseña (credenciales cifradas)"
+    } else {
+        "usuario y contraseña"
+    };
     ctx.send(format!(
-        "<b>{}</b>\nEmail: {}\nRol: {}\nEmail verificado: {}\nÚltimo login: {}\nCredenciales guardadas: {}",
+        "<b>{}</b>\nID: <code>{}</code>\nTelegram ID: <code>{}</code>\nEmail: {}\nRol: {}\nEmail verificado: {}\nÚltimo login: {}\nSesión: {}",
         escape(&user.username),
+        user.uuid,
+        ctx.uid,
         escape(&user.email),
         escape(&user.role),
         user.email_verified_at.map(|at| full_date(at, tz)).unwrap_or_else(|| "no".into()),
         user.last_login_at.map(|at| full_date(at, tz)).unwrap_or_else(|| "—".into()),
-        if stored { "sí (cifradas)" } else { "no" },
+        session_info,
     ))
     .await?;
     Ok(())

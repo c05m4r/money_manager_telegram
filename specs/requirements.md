@@ -27,6 +27,7 @@ Todo lo relacionado con Telegram (identidad, sesión, credenciales, diálogos) v
 | D6 | Comandos en inglés. Los textos de respuesta quedan en español (es-AR). |
 | D7 | `money_manager_frontend` está desmantenido: no se modifica. |
 | D8 | Para no pedir la contraseña cada 24 h (vida del JWT), el bot guarda las credenciales cifradas (AES-256-GCM) y re-loguea solo. Se puede desactivar con `STORE_CREDENTIALS=false`: en ese caso el bot pide `/login` cuando vence el JWT. |
+| D9 | `AUTH_METHOD` elige el método de login: `password` (default, D1/D8) o `telegram`. Con `telegram` no hay contraseña: la identidad es el Telegram ID, mapeado a un usuario del backend en `TELEGRAM_USERS`, y el bot firma los JWT con el `JWT_SECRET` del backend. El backend no se modifica. |
 
 ## 3. Alcance
 
@@ -82,6 +83,27 @@ Formato EARS. Criterios de aceptación en Given/When/Then.
 - **RF-01.11** El bot DEBE limitar los intentos de login fallidos: 5 por Telegram ID cada 15 minutos.
 - **RF-01.12** El bot DEBE mostrar en el menú de Telegram (`setMyCommands` con scope por chat) solo los comandos que el rol del usuario puede usar. El menú se actualiza en `/login`, `/start`, `/logout` y cuando la sesión vence.
 - **RF-01.13** Todo comando de finanzas sin sesión DEBE responder "Iniciá sesión con /login".
+- **RF-01.14** `AUTH_METHOD` DEBE aceptar `password` (default) o `telegram`. Cualquier otro valor DEBE impedir el arranque con un mensaje claro. RF-01.3 a RF-01.7 y RF-01.11 aplican solo a `password`.
+
+#### Método `telegram` (sin contraseña)
+
+- **RF-01.15** Con `AUTH_METHOD=telegram`, `JWT_SECRET` y `TELEGRAM_USERS` (`telegram_id:user_uuid,…`) son obligatorios. `CREDENTIALS_KEY` no se usa.
+- **RF-01.16** `/start` y `/login` DEBEN iniciar sesión sin pedir datos si el Telegram ID (`from.id`) está en `TELEGRAM_USERS`. Si no está, DEBEN responder con el ID a agregar y NO llamar al backend.
+- **RF-01.17** Antes de firmar un token, el bot DEBE consultar `GET /users/{uuid}` con un token de rol `user` y vida de 60 s, y rechazar usuarios inexistentes (`404`) o con `is_active = false`. El rol del token final DEBE ser el del backend (normalizado como en el backend), nunca uno configurado.
+- **RF-01.18** Los tokens firmados DEBEN tener `{sub, role, exp, jti}`, HS256 y vida `TELEGRAM_TOKEN_TTL_MINUTES` (default 60, rango 1–1440). Al vencer, el bot DEBE re-firmar repitiendo la verificación de RF-01.17.
+- **RF-01.19** Si el Telegram ID deja de estar mapeado al mismo usuario, la próxima renovación DEBE terminar la sesión.
+- **RF-01.20** Si el backend rechaza el token con `401`, el bot DEBE informar que `JWT_SECRET` no coincide y loguear un `error`.
+- **RF-01.21** Al arrancar con `AUTH_METHOD=telegram`, el bot DEBE loguear un `warn` indicando que puede actuar como cualquier usuario del backend, y otro si `JWT_SECRET` es corto o un valor de desarrollo conocido.
+
+```
+Given AUTH_METHOD=telegram, JWT_SECRET igual al del backend y TELEGRAM_USERS=123456789:<uuid de default>
+When el usuario de Telegram 123456789 envía /start
+Then el bot pide GET /users/<uuid> con un token de rol user y 60 s de vida
+ And firma un token con el rol real del usuario
+ And responde "Hola default 👋 Entraste con tu cuenta de Telegram, sin contraseña."
+When el usuario de Telegram 555 envía /start
+Then el bot responde que su ID 555 no está en TELEGRAM_USERS, sin llamar al backend
+```
 
 ```
 Given un chat sin sesión y un usuario "default" activo en el backend

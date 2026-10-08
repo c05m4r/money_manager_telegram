@@ -48,6 +48,10 @@ Todas por variables de entorno. Se cargan desde `env/.env` con `dotenvy` (igual 
 |----------|-------------|---------|-------------|
 | `TELOXIDE_TOKEN` | sí | — | token de @BotFather |
 | `BACKEND_API_URL` | no | `http://127.0.0.1:8000/api/v1` | URL base de la API |
+| `AUTH_METHOD` | no | `password` | `password` o `telegram` (D9) |
+| `JWT_SECRET` | si `AUTH_METHOD=telegram` | — | el mismo `JWT_SECRET` del backend |
+| `TELEGRAM_USERS` | si `AUTH_METHOD=telegram` | — | `telegram_id:user_uuid,…` |
+| `TELEGRAM_TOKEN_TTL_MINUTES` | no | `60` | vida de los tokens firmados por el bot (1–1440) |
 | `STORE_CREDENTIALS` | no | `true` | guarda las credenciales cifradas para re-loguear solo (D8). `false`: el bot pide `/login` cada vez que vence el JWT |
 | `CREDENTIALS_KEY` | sí, si `STORE_CREDENTIALS=true` | — | clave AES-256 en base64 (32 bytes). Generar con `openssl rand -base64 32`. Si se pierde o cambia, las credenciales guardadas no se pueden descifrar y cada usuario debe hacer `/login` de nuevo |
 | `ALLOWED_TELEGRAM_IDS` | no | vacío = todos | IDs numéricos de Telegram separados por coma, p. ej. `123456789,987654321`. Para conocer el propio ID: escribirle a @userinfobot |
@@ -216,6 +220,22 @@ token_for(telegram_user_id):
 - `exp` se lee del payload del JWT (base64, sin verificar firma: el bot no tiene la clave y solo lo usa para saber cuándo renovar).
 - Un `Mutex` por `telegram_user_id` evita varios re-login en paralelo para el mismo usuario.
 - El menú por rol (`setMyCommands`) se actualiza en `/login`, `/start`, `/logout` y al vencer la sesión (RF-01.12).
+
+### 7.2.1 Método `telegram` (`session/minter.rs`)
+
+```
+login_telegram(telegram_user_id):
+  user_uuid = TELEGRAM_USERS[telegram_user_id]            (si no está → error con el ID, sin llamar al backend)
+  bootstrap = firmar(sub=user_uuid, role="user", exp=60 s)
+  user = GET /users/{user_uuid} con bootstrap               (401 → JWT_SECRET distinto; 404 → no existe)
+  si !user.is_active → error
+  token = firmar(sub=user_uuid, role=normalize(user.role), exp=TELEGRAM_TOKEN_TTL_MINUTES, jti=uuid v4)
+  upsert sessions(jwt=token, credentials=NULL)
+```
+
+- `auth()` con el JWT vencido: si `TELEGRAM_USERS[telegram_user_id]` sigue apuntando a `session.user_uuid`, repite la verificación y re-firma; si no, borra la sesión.
+- Firma con `jsonwebtoken` (mismo crate y algoritmo que el backend, `Header::default()` = HS256).
+- El token bootstrap tiene rol `user` (el menor) y 60 s de vida: solo sirve para leer el propio perfil.
 
 ### 7.3 DTOs (`api/models.rs`)
 
@@ -408,6 +428,7 @@ Todo callback llama `answer_callback_query` y edita el mensaje original cuando c
 
 - **Contraseña en el chat**: pasa por Telegram una vez, en el `/login`. El bot borra el mensaje apenas lo lee (RF-01.4). Telegram la ve en tránsito; es el costo de no tener frontend.
 - **Credenciales en reposo**: cifradas con AES-256-GCM. `CREDENTIALS_KEY` vive solo en el entorno del proceso, nunca en el SQLite, en logs ni en la imagen Docker. Quien tenga el archivo SQLite **y** la clave puede recuperar contraseñas: proteger el host del bot como se protege el backend. Con `STORE_CREDENTIALS=false` no se guardan contraseñas.
+- **`AUTH_METHOD=telegram`**: el bot tiene el `JWT_SECRET` del backend y puede firmar tokens de cualquier usuario y rol. La superficie de ataque del host del bot pasa a ser la misma que la del backend. Mitigaciones: mapeo explícito `TELEGRAM_USERS` (sin mapeo no hay sesión), rol leído del backend, verificación de `is_active` en cada renovación, tokens cortos (60 min), `jti` único revocable con `/logout`, `warn` al arrancar. Se usa el Telegram ID numérico y no el `@username`, que se puede cambiar o reasignar.
 - **Rotar `CREDENTIALS_KEY`**: invalida todas las credenciales guardadas (no se pueden descifrar); los usuarios hacen `/login` de nuevo cuando venza su JWT.
 - **Riesgo aceptado**: quien controle la cuenta de Telegram del usuario controla sus finanzas en el bot. El README recomienda activar la verificación en dos pasos de Telegram.
 - `/logout` revoca el JWT en el backend (BK-5) y borra JWT y credenciales del SQLite.
@@ -435,6 +456,7 @@ Todo callback llama `answer_callback_query` y edita el mensaje original cuando c
 | 2 | Long polling | webhooks | sin dominio ni TLS propio; migrable luego |
 | 3 | Login con `POST /auth/login` desde el chat y credenciales cifradas en el bot | endpoints de vinculación Telegram en el backend | el backend no debe saber de Telegram; todo lo de Telegram vive en el bot |
 | 4 | Re-login automático con credenciales cifradas (configurable) | pedir la contraseña cada 24 h | UX de "loguearse una vez" sin cambiar el backend (D8) |
+| 10 | Método `telegram`: el bot firma JWT con el `JWT_SECRET` del backend | endpoint de login por Telegram en el backend; contraseñas configuradas por el operador | sin contraseña y sin código de Telegram en el backend (D9). Costo: el bot comparte el secreto del backend |
 | 5 | SQLite para sesiones y diálogos | memoria / Redis | sobrevive reinicios sin infraestructura extra (D3) |
 | 6 | Agregaciones en el backend (`/reports/*`) | calcular en el bot | SQL agrega sin traer todas las filas; endpoint genérico, sirve a cualquier cliente (BK-4) |
 | 7 | Comandos en inglés, textos en español | todo en un idioma | D6 |

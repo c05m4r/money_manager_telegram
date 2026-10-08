@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Marcos Gabriel Miller
 pub mod catalog;
 pub mod crypto;
+pub mod minter;
 pub mod store;
 
 use std::{
@@ -13,10 +14,14 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use uuid::Uuid;
 
 use crate::{
-    api::{ApiClient, ApiError, models::LoginResponse},
+    api::{
+        ApiClient, ApiError,
+        models::{LoginResponse, User},
+    },
     errors::{BotError, BotResult},
 };
 use crypto::CredentialCipher;
+use minter::{TokenMinter, normalize_role};
 use store::{SessionRow, Store};
 
 /// Renew the JWT this many seconds before it expires.
@@ -59,18 +64,30 @@ pub struct SessionManager {
     api: ApiClient,
     store: Store,
     cipher: Option<CredentialCipher>,
+    /// `Some` with `AUTH_METHOD=telegram`: tokens are signed by the bot, no password.
+    minter: Option<TokenMinter>,
     /// One lock per user so concurrent updates do not trigger several logins.
     locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionManager {
-    pub fn new(api: ApiClient, store: Store, credentials_key: Option<[u8; 32]>) -> Self {
+    pub fn new(
+        api: ApiClient,
+        store: Store,
+        credentials_key: Option<[u8; 32]>,
+        minter: Option<TokenMinter>,
+    ) -> Self {
         Self {
             api,
             store,
             cipher: credentials_key.as_ref().map(CredentialCipher::new),
+            minter,
             locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn uses_telegram_auth(&self) -> bool {
+        self.minter.is_some()
     }
 
     pub fn stores_credentials(&self) -> bool {
@@ -149,6 +166,74 @@ impl SessionManager {
         Ok(response)
     }
 
+    /// `AUTH_METHOD=telegram` login: the Telegram account id is the identity, no password.
+    pub async fn login_telegram(&self, telegram_user_id: i64, chat_id: i64) -> BotResult<User> {
+        let lock = self.lock_for(telegram_user_id);
+        let _guard = lock.lock().await;
+
+        let minter = self
+            .minter
+            .as_ref()
+            .ok_or_else(|| BotError::user("El login por Telegram no está habilitado."))?;
+        let user_uuid = minter.user_for(telegram_user_id).ok_or_else(|| {
+            BotError::user(format!(
+                "Tu cuenta de Telegram no está habilitada en este bot. \
+                 Pedile al operador que agregue tu ID {telegram_user_id} a TELEGRAM_USERS."
+            ))
+        })?;
+        let (user, token, expires_at) = self.mint_verified(minter, user_uuid).await?;
+        self.store
+            .upsert_session(&SessionRow {
+                telegram_user_id,
+                chat_id,
+                user_uuid,
+                username: user.username.clone(),
+                role: normalize_role(&user.role).to_string(),
+                jwt: Some(token),
+                jwt_expires_at: Some(expires_at),
+                credentials: None,
+            })
+            .await?;
+        tracing::info!(telegram_user_id, %user_uuid, "logged in via Telegram identity");
+        Ok(user)
+    }
+
+    /// Signs a token with the user's real role, after checking with the backend that the user
+    /// exists and is active (signed tokens skip the backend's own login checks).
+    async fn mint_verified(
+        &self,
+        minter: &TokenMinter,
+        user_uuid: Uuid,
+    ) -> BotResult<(User, String, i64)> {
+        let bootstrap = minter
+            .mint_bootstrap(user_uuid)
+            .map_err(|error| BotError::Token(error.to_string()))?;
+        let user = match self.api.get_user(&bootstrap, user_uuid).await {
+            Ok(user) => user,
+            Err(ApiError::Http { status: 401, .. }) => {
+                tracing::error!(
+                    "backend rejected a bot-signed token: JWT_SECRET differs from the backend's"
+                );
+                return Err(BotError::user(
+                    "El backend rechazó el token del bot (JWT_SECRET no coincide). Avisale al operador.",
+                ));
+            }
+            Err(ApiError::Http { status: 404, .. }) => {
+                return Err(BotError::user(
+                    "El usuario configurado para tu Telegram no existe en el backend.",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !user.is_active {
+            return Err(BotError::user("Tu usuario del backend está desactivado."));
+        }
+        let (token, expires_at) = minter
+            .mint(user_uuid, normalize_role(&user.role))
+            .map_err(|error| BotError::Token(error.to_string()))?;
+        Ok((user, token, expires_at))
+    }
+
     /// A valid token for the user, re-logging in with stored credentials when needed.
     pub async fn auth(&self, telegram_user_id: i64) -> BotResult<Auth> {
         let lock = self.lock_for(telegram_user_id);
@@ -169,6 +254,33 @@ impl SessionManager {
                 role: session.role,
                 token: token.clone(),
             });
+        }
+
+        if let Some(minter) = &self.minter {
+            // Mapping removed from TELEGRAM_USERS, or pointed to another user: end the session.
+            if minter.user_for(telegram_user_id) != Some(session.user_uuid) {
+                self.store.delete_session(telegram_user_id).await?;
+                return Err(BotError::SessionExpired);
+            }
+            return match self.mint_verified(minter, session.user_uuid).await {
+                Ok((user, token, expires_at)) => {
+                    let role = normalize_role(&user.role);
+                    self.store
+                        .update_token(telegram_user_id, &token, expires_at, role)
+                        .await?;
+                    Ok(Auth {
+                        telegram_user_id,
+                        user_uuid: session.user_uuid,
+                        role: role.to_string(),
+                        token,
+                    })
+                }
+                Err(error @ BotError::User(_)) => {
+                    self.store.delete_session(telegram_user_id).await?;
+                    Err(error)
+                }
+                Err(error) => Err(error),
+            };
         }
 
         let (Some(cipher), Some(blob)) = (&self.cipher, &session.credentials) else {
@@ -295,14 +407,14 @@ mod tests {
     fn login_ok(token: &str) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(json!({
             "token": token,
-            "user": {"uuid": USER, "username": "default", "email": "d@example.com", "role": "user",
+            "user": {"uuid": USER, "username": "default", "email": "d@example.com", "role": "user", "is_active": true,
                      "email_verified_at": null, "last_login_at": null}
         }))
     }
 
     async fn manager(server: &MockServer, key: Option<[u8; 32]>) -> SessionManager {
         let api = ApiClient::new(&server.uri(), Duration::from_secs(5)).unwrap();
-        SessionManager::new(api, memory_store().await, key)
+        SessionManager::new(api, memory_store().await, key, None)
     }
 
     fn future() -> i64 {
@@ -417,7 +529,7 @@ mod tests {
             .and(path(format!("/users/{USER}")))
             .and(header("authorization", format!("Bearer {second}").as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "uuid": USER, "username": "default", "email": "d@example.com", "role": "user",
+                "uuid": USER, "username": "default", "email": "d@example.com", "role": "user", "is_active": true,
                 "email_verified_at": null, "last_login_at": null
             })))
             .expect(1)
@@ -499,5 +611,151 @@ mod tests {
             sessions.auth(UID).await,
             Err(BotError::NotLoggedIn)
         ));
+    }
+
+    // ---------- AUTH_METHOD=telegram ----------
+
+    use crate::config::TelegramAuth;
+    use jsonwebtoken::{DecodingKey, Validation, decode};
+
+    const SECRET: &str = "backend-secret";
+
+    fn telegram_manager_with(
+        server: &MockServer,
+        store: Store,
+        users: &[(i64, &str)],
+    ) -> SessionManager {
+        let auth = TelegramAuth {
+            jwt_secret: SECRET.into(),
+            users: users
+                .iter()
+                .map(|(id, uuid)| (*id, Uuid::parse_str(uuid).unwrap()))
+                .collect(),
+            token_ttl: Duration::from_secs(600),
+        };
+        let api = ApiClient::new(&server.uri(), Duration::from_secs(5)).unwrap();
+        SessionManager::new(api, store, None, Some(TokenMinter::new(&auth)))
+    }
+
+    fn user_body(role: &str, active: bool) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": USER, "username": "default", "email": "d@example.com", "role": role,
+            "is_active": active, "email_verified_at": null, "last_login_at": null
+        }))
+    }
+
+    fn role_of(token: &str) -> String {
+        let mut validation = Validation::default();
+        validation.validate_exp = true;
+        decode::<serde_json::Value>(
+            token,
+            &DecodingKey::from_secret(SECRET.as_bytes()),
+            &validation,
+        )
+        .unwrap()
+        .claims["role"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn telegram_login_signs_token_with_backend_role() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/users/{USER}")))
+            .respond_with(user_body("Manager", true))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let sessions = telegram_manager_with(&server, memory_store().await, &[(UID, USER)]);
+
+        let user = sessions.login_telegram(UID, UID).await.unwrap();
+        assert_eq!(user.username, "default");
+        let auth = sessions.auth(UID).await.unwrap();
+        assert_eq!(auth.role, "manager");
+        assert_eq!(
+            role_of(&auth.token),
+            "manager",
+            "token carries the backend role"
+        );
+        assert!(
+            !sessions.has_credentials(UID).await.unwrap(),
+            "no password stored"
+        );
+
+        // The profile lookup used a least-privileged bootstrap token.
+        let request = &server.received_requests().await.unwrap()[0];
+        let bearer = request
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(role_of(bearer.trim_start_matches("Bearer ")), "user");
+    }
+
+    #[tokio::test]
+    async fn telegram_login_rejects_unmapped_inactive_and_bad_secret() {
+        let server = MockServer::start().await;
+        let sessions = telegram_manager_with(&server, memory_store().await, &[(UID, USER)]);
+        let error = sessions.login_telegram(7, 7).await.unwrap_err();
+        assert!(
+            error.user_message().contains("TELEGRAM_USERS"),
+            "{}",
+            error.user_message()
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "unmapped users never reach the backend"
+        );
+
+        Mock::given(path(format!("/users/{USER}")))
+            .respond_with(user_body("user", false))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let error = sessions.login_telegram(UID, UID).await.unwrap_err();
+        assert_eq!(
+            error.user_message(),
+            "Tu usuario del backend está desactivado."
+        );
+
+        Mock::given(path(format!("/users/{USER}")))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let error = sessions.login_telegram(UID, UID).await.unwrap_err();
+        assert!(error.user_message().contains("JWT_SECRET"));
+        assert!(sessions.store.get_session(UID).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn telegram_session_renews_and_ends_when_unmapped() {
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/users/{USER}")))
+            .respond_with(user_body("user", true))
+            .mount(&server)
+            .await;
+        let store = memory_store().await;
+        let sessions = telegram_manager_with(&server, store.clone(), &[(UID, USER)]);
+        sessions.login_telegram(UID, UID).await.unwrap();
+        let first = sessions.auth(UID).await.unwrap().token;
+
+        store.expire_token(UID).await.unwrap();
+        let renewed = sessions.auth(UID).await.unwrap().token;
+        assert_ne!(
+            first, renewed,
+            "expired token is re-signed without any password"
+        );
+
+        // Operator removed the user from TELEGRAM_USERS and restarted the bot.
+        store.expire_token(UID).await.unwrap();
+        let other = telegram_manager_with(&server, store.clone(), &[(99, USER)]);
+        assert!(matches!(
+            other.auth(UID).await,
+            Err(BotError::SessionExpired)
+        ));
+        assert!(store.get_session(UID).await.unwrap().is_none());
     }
 }

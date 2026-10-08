@@ -48,10 +48,24 @@ async fn run() -> Result<(), String> {
     if config.backend_is_insecure() {
         tracing::warn!(url = %config.backend_api_url, "BACKEND_API_URL is plain HTTP to a remote host; use https://");
     }
-    if config.credentials_key.is_none() {
-        tracing::info!(
-            "STORE_CREDENTIALS=false: users will be asked to /login again when their token expires"
-        );
+    match &config.auth {
+        config::AuthMethod::Telegram(auth) => {
+            tracing::warn!(
+                users = auth.users.len(),
+                "AUTH_METHOD=telegram: the bot signs backend JWTs with JWT_SECRET and can act as any backend user; protect this host like the backend"
+            );
+            if auth.jwt_secret.len() < 32
+                || ["dev-secret", "dev-change-me"].contains(&auth.jwt_secret.as_str())
+            {
+                tracing::warn!("JWT_SECRET looks weak or is a development default");
+            }
+        }
+        config::AuthMethod::Password if config.credentials_key.is_none() => {
+            tracing::info!(
+                "STORE_CREDENTIALS=false: users will be asked to /login again when their token expires"
+            );
+        }
+        config::AuthMethod::Password => {}
     }
 
     let store = Store::open(&config.database_path)
@@ -77,7 +91,7 @@ async fn run() -> Result<(), String> {
         tracing::warn!(%error, "set_my_commands failed");
     }
 
-    tracing::info!(bot = %username, backend = %config.backend_api_url, "starting");
+    tracing::info!(bot = %username, backend = %config.backend_api_url, auth = config.auth.name(), "starting");
     let app = Arc::new(App::new(config, username, api, store));
 
     Dispatcher::builder(bot, bot::schema())
